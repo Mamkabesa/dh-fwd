@@ -36,6 +36,10 @@ Or:
 ./dh-fwd <serial> [options]
 
 ```
+### Known bugs
+
+• Authentication through the web browser is not working (cam's response: Login error)
+
 ### Flags
 | Flag | Short | Description |
 |---|---|---|
