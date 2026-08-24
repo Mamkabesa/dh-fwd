@@ -33,6 +33,10 @@ go build .
 ```
 ./dh-fwd <serial> [options]
 ```
+## Известные баги
+
+• Не работает вход через браузер (ответ камеры: "Ошибка входа!" или "Login error!" в зависимости от локализации), из-за чего может временами отваливаться соединение по 80 порту
+
 ### Флаги
 
 | Флаг | Короткий | Что делает |
@@ -113,9 +117,9 @@ echo '<hex>' | ./dh-fwd -D
 
 ## Благодарности
 
-За базу было взято:
-- https://github.com/khoanguyen-3fc/dh-p2p — основной источник инфы про протокол
-- https://github.com/thebadinteger/p2pwn/tree/main/core/p2p — доп. источник
+За основу были взяты:
+- https://github.com/khoanguyen-3fc/dh-p2p — базовая реализация dh-p2p
+- https://github.com/thebadinteger/p2pwn/tree/main/core/p2p
 
 Большое спасибо этим людям: **thebadinteger** и **khoanguyen-3fc**.
 
