@@ -38,13 +38,13 @@ Or:
 ```
 ### Known bugs
 
-• Authentication through the web browser is not working (cam's response: Login error)
+- Authentication through the web browser is not working (cam's response: Login error)
 
 ### Under development
 
-• Add support for cameras which require Type 1 Auth
-• Fix some bugs
-• Add support for web login via port 80
+- Add support for cameras which require Type 1 Auth
+- Fix some bugs
+- Add support for web login via port 80
 
 ### Flags
 | Flag | Short | Description |
