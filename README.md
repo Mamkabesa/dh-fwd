@@ -114,8 +114,9 @@ Useful for reverse engineering and debugging: capture a packet (e.g. with tcpdum
 Based on:
  * khoanguyen-3fc/dh-p2p — main protocol reference
  * thebadinteger/p2pwn — additional reference
+
 Special thanks to: **thebadinteger** and **khoanguyen-3fc**.
 ## ⚠️ Disclaimer
 This tool was created for educational and authorized testing purposes only. Do not use it on devices you do not own or do not have explicit permission to test.
-## License
+## License 
 GNU General Public License v3.0 (GPLv3). See LICENSE for details.
