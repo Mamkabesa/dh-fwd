@@ -1,9 +1,3 @@
-/*
- * ports_test.go — unit tests for the "-p" port spec parser
- * (parsePortLists + makePortSpecs). Each case covers a CLI form:
- * explicit pairs, camera-only lists, ranges, and error inputs.
- */
-
 package main
 
 import "testing"

@@ -1,26 +1,3 @@
-/*
- * main.go — entry point, CLI parsing and multi-port orchestration.
- *
- * The binary tunnels ports of a Dahua-style P2P camera (identified by
- * its serial number) to localhost over the DH "Dahua HTTP P2P" cloud
- * protocol. The CLI keeps Python-compatible flags and argument order
- * (the serial may be typed before any flag), so it can be dropped in
- * as a drop-in replacement for the original script.
- *
- * Three modes of operation:
- *   --decode [--decode-type dhttp|istun|ptcp] <hex> — offline dissector
- *                                          (see decode.go);
- *   single port (no --port)               — one tunnel, plain stdout;
- *   multi-port (--port ... / --threads N) — port registry + live UI,
- *                                           one tunnel per thread.
- *
- * Ports may be given as explicit local:remote pairs ("5080:80"),
- * camera-only lists ("80-85", local = ephemeral :0), or ranges. The
- * registry tracks every requested port through Connecting → OK/FAIL
- * and, on partial failure, asks the operator whether to retry the
- * failed ports or close everything.
- */
-
 package main
 
 import (
@@ -52,12 +29,6 @@ type failEntry struct {
 	reason string
 }
 
-// PortRegistry — thread-safe status book for every requested port.
-//
-// Tunnels report progress through okPort/fail/connecting. When the last
-// Connecting port settles (pending reaches 0) a notification is pushed
-// on `notify` so the orchestrator can summarise the result or prompt
-// the operator about failed ports.
 type PortRegistry struct {
 	mu          sync.Mutex
 	serial      string
@@ -146,7 +117,6 @@ func (r *PortRegistry) pendingCount() int {
 	return r.pending
 }
 
-// summary — actual local ports (after bind) + camera remote ports.
 func (r *PortRegistry) summary() (remotes, locals []int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -175,8 +145,6 @@ func (r *PortRegistry) failEntries() []failEntry {
 }
 
 func main() {
-	// Python-compatible: allow serial before flags, e.g. "dh-fwd <serial> --port ...".
-	// The serial is moved to the end of os.Args so flag parsing sees only flags.
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		serial := os.Args[1]
 		rest := append([]string{os.Args[0]}, os.Args[2:]...)
@@ -260,8 +228,6 @@ func main() {
 		threads = 1
 	}
 
-	// Multi-port mode: several ports OR explicitly set --threads/-mt.
-	// Otherwise — single-port mode without UI.
 	multi := len(specs) > 1
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "threads" || f.Name == "mt" {
@@ -276,7 +242,6 @@ func main() {
 	}
 }
 
-// usage prints a grouped, human-readable flag reference to stderr.
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: dh-fwd [options] <serial>
 
@@ -312,10 +277,6 @@ Examples:
 `)
 }
 
-/* ---------- Port spec parsing ---------- */
-
-// parsePortSpec resolves the effective port list: the --port flag wins,
-// otherwise one default tunnel (local 554 <-> camera 554).
 func parsePortSpec(portSpec string) ([]PortSpec, error) {
 	if portSpec != "" {
 		locals, remotes, err := parsePortLists(portSpec)
@@ -327,10 +288,6 @@ func parsePortSpec(portSpec string) ([]PortSpec, error) {
 	return []PortSpec{{Local: 554, Remote: 554}}, nil
 }
 
-// parsePortLists splits a "--port" spec into local and camera (remote) lists:
-//   - "l1,l2,l3:r1,r2,r3" — explicit pairs, 0 as local = ephemeral port;
-//   - "8081" or "80-85" without ':' — CAMERA ports only, local is always
-//     ephemeral (:0, the OS assigns a free port).
 func parsePortLists(spec string) (locals, remotes []int, err error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
@@ -434,14 +391,6 @@ func runSingle(serial string, spec PortSpec, dtype int, username, password, rand
 	})
 }
 
-/* ---------- Tunnel orchestration ---------- */
-
-// verifyDevice checks the serial is both registered with the cloud and
-// actually reachable BEFORE any tunnel is brought up. The p2psrv online
-// lookup alone passes even for powered-off devices, so the check goes one
-// step further and probes the /device/<sn>/p2p-channel endpoint exactly
-// like the real handshake: an offline or unknown device answers 404, which
-// is caught here instead of surfacing as per-port [FAIL] spam.
 func verifyDevice(serial string, dtype int, username, password, randsalt string, debug bool) bool {
 	u := NewUDP(MAIN_SERVER, MAIN_PORT, debug)
 	defer u.Close()
@@ -481,10 +430,6 @@ func distribute(specs []PortSpec, threads int) []specGroup {
 	return groups
 }
 
-// runMulti — the multi-port dashboard. Specs are round-robin distributed
-// across `threads` tunnels (each tunnel opens several ports over one PTCP
-// channel). It then blocks on the registry, summarising when everything
-// settles and offering to retry/close on partial failure.
 func runMulti(serial string, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool) {
 	if !verifyDevice(serial, dtype, username, password, randsalt, debug) {
 		deviceNotFound(serial)
@@ -523,8 +468,6 @@ func runMulti(serial string, specs []PortSpec, threads int, dtype int, username,
 				}
 			}
 			if allNotFound {
-				// The serial is unknown or the device is off — retrying or
-				// asking the operator is pointless, close and leave.
 				deviceNotFound(serial)
 				live.Range(func(k, v any) bool {
 					v.(*Tunnel).close()

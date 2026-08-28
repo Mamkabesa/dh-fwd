@@ -1,18 +1,3 @@
-/*
- * decode.go — offline packet dissector (dh-fwd --decode).
- *
- * Takes raw hex from argv or stdin and pretty-prints a single protocol
- * layer, selected with -T:
- *
- *   dhttp — the DH HTTP-over-UDP request/response (headers + XML body);
- *   istun — Dahua's bit-inverted STUN (binding, mapped addresses...);
- *   ptcp  — the 24-byte Phony-TCP frame and its body (0x00 SYNC,
- *           0x10 DATA, 0x11 BIND, 0x12 STATUS, 0x13 HEARTBEAT).
- *
- * With no -T, autoDecode sniffs the first bytes (DH/HTTP magic, "PTCP"
- * or an 0xFF/0xFE inverted STUN) and picks the matching layer.
- */
-
 package main
 
 import (

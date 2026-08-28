@@ -1,30 +1,3 @@
-/*
- * helpers.go — protocol primitives shared by the whole tool.
- *
- * Four layers are implemented here:
- *
- *  1. Credentials & crypto — get_key / get_enc / get_dec / get_auth:
- *     the DH auth chain. The password is turned into a hex MD5 key,
- *     LocalAddr is encrypted with PBKDF2-derived AES-OFB (type 1
- *     devices), and the final auth token is an HMAC-SHA256 over
- *     "<nonce><date><payload>".
- *
- *  2. PTCP framing — PTCP is Dahua's "Phony TCP": a 24-byte header
- *     carrying byte/message sequence state, followed by a body. The
- *     DATA body itself wraps a PTCPPayload (realm + stream bytes), the
- *     per-connection channel inside the PTCP session.
- *
- *  3. DH HTTP-over-UDP — requests like DHPOST /device/<sn>/p2p-channel
- *     are plain HTTP/1.1 text over a UDP socket. DHResponse +
- *     ParseDHResponse turn the reply into status + headers + an
- *     XML-flattened body map (parseXML).
- *
- *  4. UDP socket wrapper — UDP holds one socket, its local/remote
- *     addresses and the PTCP sequence state machine (sent/recv byte
- *     counters, packet ids, message ids), plus the DH HTTP request /
- *     response helpers built on top of it.
- */
-
 package main
 
 import (
@@ -52,13 +25,9 @@ import (
 )
 
 const (
-	// MAIN_SERVER / MAIN_PORT — the DH cloud registrar every session
-	// starts from: device discovery, p2p-channel and relay lookups.
 	MAIN_SERVER = "www.easy4ipcloud.com"
 	MAIN_PORT   = 8800
 
-	// Shared client credentials baked into the DH WSSE auth. RANDSALT
-	// can be overridden per-run via --randsalt (e.g. from an info blob).
 	USERNAME = "cba1b29e32cb17aa46b8ff9e73c7f40b"
 	USERKEY  = "996103384cdf19179e19243e959bbf8b"
 	RANDSALT = ""
@@ -70,9 +39,6 @@ var (
 	cseq     uint32
 )
 
-/* ---------- DH auth chain ---------- */
-
-// get_key derives the 32-hex MD5 key from username, password and salt.
 func get_key(username, password, randsalt string) []byte {
 	salt := randsalt
 	if salt == "" {
@@ -131,11 +97,6 @@ func get_auth(username string, key []byte, nonce int, payload, randsalt string) 
 	)
 }
 
-/* ---------- PTCP framing ---------- */
-
-// PTCPPayload is the DATA carrier inside a PTCP body: a 32-bit realm
-// (the per-connection channel id) followed by the raw stream bytes.
-// The high bit of the length field is the "more data" marker.
 type PTCPPayload struct {
 	Realm   uint32
 	Payload []byte
@@ -169,16 +130,6 @@ func ParsePTCPPayload(data []byte) (*PTCPPayload, error) {
 	return &PTCPPayload{Realm: realm, Payload: body}, nil
 }
 
-// PTCP is the 24-byte "Phony TCP" envelope that rides over UDP:
-//   [0:4]   magic "PTCP"
-//   [4:8]   Rlid — remote byte counter (how many bytes the peer sent)
-//   [8:12]  Llid — local byte counter (how many bytes we sent)
-//   [12:16] Pid  — packet id
-//   [16:20] Lmid — local message id
-//   [20:24] Rmid — remote message id
-//   [24:]   Body
-// Byte counters act as a UDP retransmission/ordering window; every
-// received frame must be acknowledged by echoing it back (see UDP).
 type PTCP struct {
 	Rlid uint32
 	Llid uint32
@@ -217,10 +168,6 @@ func ParsePTCP(data []byte) (*PTCP, error) {
 	}, nil
 }
 
-/* ---------- DH HTTP-over-UDP ---------- */
-
-// DHResponse is a parsed reply to a DH request: HTTP status line,
-// headers and the XML body flattened into "tag/path" -> text pairs.
 type DHResponse struct {
 	Version string
 	Code    int
@@ -262,12 +209,6 @@ func ParseDHResponse(data string) *DHResponse {
 	return resp
 }
 
-/* ---------- UDP socket wrapper ---------- */
-
-// UDP wraps one UDP socket with DH HTTP request/reply helpers and the
-// PTCP sequence state. Concurrency contract: PTCP counters are guarded
-// by ptcpMu; the socket itself must have a single reader goroutine
-// (see Tunnel.readLoop) so SetReadDeadline never races.
 type UDP struct {
 	conn *net.UDPConn
 

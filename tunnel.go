@@ -1,30 +1,3 @@
-/*
- * tunnel.go — the core of the tool: one complete DH P2P session, from
- * handshake through concurrent serving, plus the retry machinery.
- *
- * Handshake phases (see handshake()):
- *   1. p2psrv discovery  — find the camera's P2P server and probe it;
- *   2. relay session     — ask the cloud for a relay agent, open a PTCP
- *                          session on mainRemote and exchange the 0x17
- *                          sign token (the session credential);
- *   3. channel request   — /device/<sn>/p2p-channel with our Identify,
- *                          random AID and local address (AES-encrypted
- *                          for type 1 devices);
- *   4. NAT punch         — inverted-STUN against the camera using its
- *                          LocalAddr + PubAddr; if it never answers we
- *                          fall back to the already-established relay
- *                          session as the data socket;
- *   5. PTCP auth         — on the direct socket: 0x03 sync, 0x19 sign
- *                          handoff, 0x1B finish.
- *
- * Serving model: one reader goroutine per UDP socket (the only owner
- * of that socket and its PTCP counters), one heartbeat goroutine, and
- * one goroutine per accepted TCP connection that does a background
- * bind then streams data over its realm. A single failure degrades
- * gracefully: a bad bind kills only that connection, a dead channel
- * fails the tunnel and runWithRetries restarts it.
- */
-
 package main
 
 import (
@@ -48,18 +21,13 @@ const (
 	CSEQ_STEP         = 1000
 )
 
-// errDeviceNotFound — the cloud answered 404 for /device/<sn>/p2p-channel:
-// the serial does not exist or the device is powered off. Retrying is
-// pointless, so this short-circuits the retry machinery entirely.
 var errDeviceNotFound = errors.New("device response: code=404 Not Found")
 
-// notFoundPrinted — the "{SN} isn't exist or turned off." notice is emitted
-// exactly once per run, no matter how many tunnels hit the 404.
 var notFoundPrinted sync.Once
 
 func deviceNotFound(serial string) {
 	notFoundPrinted.Do(func() {
-		fmt.Printf("%s isn't exist or turned off.\n", serial)
+		fmt.Printf("%s doesn't exist or turned off.\n", serial)
 	})
 }
 
@@ -67,9 +35,6 @@ func isNotFound(reason string) bool {
 	return reason == errDeviceNotFound.Error()
 }
 
-// ptcpHeartbeat — client-initiated PTCP heartbeat (0x13, len=0, realm=0).
-// The reference implementation only acks the device's 0x13 frames; sending
-// our own keeps the direct channel alive when the device goes quiet.
 var ptcpHeartbeat = []byte{
 	0x13, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00,
@@ -97,8 +62,6 @@ type specGroup struct {
 	specs []PortSpec
 }
 
-// Tunnel — a single tunnel: full handshake + serving its own ports
-// (several local listeners, binds and realms over one PTCP channel).
 type Tunnel struct {
 	serial, username, password, randsalt string
 	dtype                                int
@@ -120,12 +83,11 @@ type Tunnel struct {
 	done         chan struct{}
 	cseqCounter  int
 
-	// concurrent serving
-	readerWG  sync.WaitGroup // readers + heartbeat goroutines
-	bindMu    sync.Mutex
-	bindWait  map[uint32]chan struct{} // realm -> bind ack channel
-	errMu     sync.Mutex
-	failErr   error
+	readerWG sync.WaitGroup // readers + heartbeat goroutines
+	bindMu   sync.Mutex
+	bindWait map[uint32]chan struct{} // realm -> bind ack channel
+	errMu    sync.Mutex
+	failErr  error
 }
 
 func newTunnel(serial string, dtype int, username, password, randsalt string, debug, logRetries bool, g specGroup, reg *PortRegistry) *Tunnel {
@@ -193,8 +155,6 @@ func (t *Tunnel) Run() error {
 	return t.serve()
 }
 
-// logf — single output point for tunnel noise. Only printed with --debug.
-// In multi-port mode writes below the status block, otherwise to stdout.
 func (t *Tunnel) logf(format string, args ...any) {
 	if !t.debug {
 		return
@@ -216,10 +176,6 @@ func (t *Tunnel) markConnecting() {
 	}
 }
 
-// p2pChannelBody builds the /device/<sn>/p2p-channel request body for the
-// given local port: our random Identify (aid), the local address the device
-// should punch to (encrypted + auth block for type > 0 devices). The
-// derived auth key is returned for later decrypting the device's reply.
 func p2pChannelBody(lport, dtype int, username, password, randsalt string, aid []byte) (string, []byte) {
 	laddr := fmt.Sprintf("127.0.0.1:%d", lport)
 	ipaddr := fmt.Sprintf("<IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr>", laddr)
@@ -355,8 +311,6 @@ func (t *Tunnel) handshake() error {
 		return fmt.Errorf("ptcp sync: %v", err)
 	}
 
-	// Sign token exchange: 0x17 on the relay session yields the session
-	// credential reused later for the direct PTCP handshake (0x19).
 	mainRemote.RequestPTCP([]byte{
 		0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
@@ -451,11 +405,6 @@ func (t *Tunnel) handshake() error {
 	}
 
 	if stunResponse == nil {
-		// No STUN response — the camera did not punch a direct hole.
-		// The relay PTCP session on mainRemote was already established
-		// earlier in this handshake, and the camera was told the agent
-		// address via /device/<sn>/relay-channel. Data flows through
-		// the agent, so we simply use it as the primary data socket.
 		t.logf("STUN failed — using relay agent as the data path")
 		t.primary = mainRemote
 		return nil
@@ -528,9 +477,6 @@ func ptcpHandshake(u *UDP, signToken []byte) error {
 	return nil
 }
 
-// serve — concurrent serving. Dedicated reader goroutine per socket,
-// binds handled in the background, data fanned out per realm. Nothing
-// in the data path ever blocks on a bind or on a slow peer.
 func (t *Tunnel) serve() error {
 	type okListen struct {
 		idx    int // index in PortRegistry
@@ -539,7 +485,7 @@ func (t *Tunnel) serve() error {
 	}
 	oks := []okListen{}
 	for i, spec := range t.specs {
-		ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", spec.Local))
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", spec.Local))
 		if err != nil {
 			t.logf("listen :%d failed: %v", spec.Local, err)
 			if t.reg != nil {
@@ -572,7 +518,6 @@ func (t *Tunnel) serve() error {
 		}
 	}
 
-	// grace period so the first read does not count as stale
 	t.primary.lastRecv = time.Now()
 
 	t.readerWG.Add(3)
@@ -591,15 +536,6 @@ func (t *Tunnel) serve() error {
 	}
 }
 
-// readLoop owns one socket: it is the ONLY reader, so SetReadDeadline
-// and the PTCP sequence counters never race across goroutines. Every
-// frame is ACKed on the socket it arrived on. The primary data socket
-// (direct or relay) is also the tunnel health monitor — silence for
-// HEARTBEAT_TIMEOUT kills the tunnel and hands control to the retry
-// machinery. The non-primary socket is read too: in direct mode this
-// keeps the relay registration alive (and can even carry data if the
-// camera decides to use it); in relay mode the direct socket is just
-// dormant.
 func (t *Tunnel) readLoop(u *UDP) {
 	defer t.readerWG.Done()
 	for {
@@ -667,8 +603,6 @@ func (t *Tunnel) acceptLoop(ln net.Listener, remotePort int) {
 	}
 }
 
-// handleBind runs in its own goroutine. A bind timeout fails only that
-// connection — the tunnel, other realms and other ports stay alive.
 func (t *Tunnel) handleBind(ac acceptConn) {
 	realmID := rand.Uint32()
 	t.logf("Binding realm=%#010x port=%d", realmID, ac.remotePort)
@@ -676,8 +610,6 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	wait := make(chan struct{})
 	t.setBindWait(realmID, wait)
 
-	// Register the client BEFORE the bind so early camera data is
-	// already routed to the accepted connection.
 	t.addClient(realmID, ac.conn)
 
 	bindPkt := make([]byte, 20)
@@ -762,10 +694,6 @@ func (t *Tunnel) clientReader(conn net.Conn, realmID uint32) {
 	}
 }
 
-// routePTCP is called only from readLoop goroutines. The frame is
-// ACKed on the socket that carried it, then routed: DATA to the realm's
-// client, STATUS to either a pending bind or a live client, heartbeat
-// just refreshes liveness (ReadPTCP already bumped lastRecv).
 func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 	if len(p.Body) == 0 {
 		src.RequestPTCP(nil)
@@ -794,7 +722,6 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 			t.logf("DVR DISC realm=%#010x", realm)
 		}
 	case 0x13:
-		// heartbeat from device
 	default:
 		t.logf("PTCP type=%#04x len=%d", p.Body[0], len(p.Body))
 		if len(p.Body) >= 12 {
@@ -829,12 +756,6 @@ func (t *Tunnel) failure() error {
 	return t.failErr
 }
 
-// runWithRetries silently restarts a tunnel after it crashes. It allows
-// RETRY_ATTEMPTS tries, logging "Tunnel failed, reason - ..., retrying
-// N/3" in between. When exhausted, ports move to [FAIL] (or the legacy
-// onExhausted callback is invoked for single-port mode). A 404 from the
-// device (unknown serial / device off) is not retried: the notice is
-// printed once and the tunnel is failed immediately.
 func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 	for attempt := 1; ; attempt++ {
 		err := t.Run()
