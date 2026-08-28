@@ -40,15 +40,16 @@ Or:
 
 • Authentication through the web browser is not working (cam's response: Login error)
 
+### Under development
+
+• Add support for cameras which require Type 1 Auth
+• Fix some bugs
+• Add support for web login via port 80
+
 ### Flags
 | Flag | Short | Description |
 |---|---|---|
 | --debug | -d | Verbose protocol debug output (requests, STUN packets, PTCP frames) |
-| --log-retries | -lr | Log retries with timestamps |
-| --type | -t | Device type: 0 — no auth (default), 1 — with auth |
-| --username | -u | Username (for --type 1) |
-| --password | -P | Password (for --type 1) |
-| --randsalt | -s | RandSalt from info blob (for --type 1) |
 | --port | -p | Port mapping (see below) |
 | --threads | -mt | Number of threads (default 3) |
 | --decode | -D | Packet decoder mode |
