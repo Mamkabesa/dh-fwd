@@ -39,6 +39,7 @@ Or:
 ### Known bugs
 
 - Authentication through the web browser is not working (cam's response: Login error)
+- Dahua may reject requests due to time mismatch
 
 ### Under development
 
