@@ -69,11 +69,11 @@ There are two ports: **local** (the one we listen on) and **remote** (the one th
  * If no port is specified, default port 554 is used.
 Local ports are bound to 127.0.0.1.
 
-**Note:** If you run the software without the -p flag or specify a listening port <1024 without running the program with sudo, you may encounter the following error:
-
-```sh
-Tunnel failed, reason - no listeners available for tunnel
-```
+> [!WARNING]
+> If you run the software without the -p flag or specify a listening port <1024 without running the program with sudo, you may encounter the following error:
+> ```sh
+> Tunnel failed, reason - no listeners available for tunnel
+> ```
 
 ## Modes
 **Single** — forwards only 1 port:
@@ -103,8 +103,8 @@ echo '<hex>' | ./dh-fwd -D
 ```
 ## What is Dahua P2P protocol?
 This is a proprietary Dahua cloud protocol used to connect to cameras via the cloud, even if the device is behind multiple NATs. The connection sequence operates as follows: the client (SmartPSS or dh-fwd) sends a request to the main server → receives an intermediate server → creates a communication channel → attempts NAT traversal → establishes a tunnel.
-> ⚠️ **IMPORTANT:** Until 2025, Dahua P2P servers established tunnels without mandatory authentication. Following reported protocol vulnerabilities, devices released after late 2024 require authentication **BEFORE** establishing a tunnel.
-> 
+> [!IMPORTANT]
+> Until 2025, Dahua P2P servers established tunnels without mandatory authentication. Following reported protocol vulnerabilities, devices released after late 2024 require authentication **BEFORE** establishing a tunnel. 
 ## Decode Mode Details
 The -T flag specifies which layer to decode, while auto detects it by the first 4 magic bytes:
  * **dhttp** — DH HTTP-over-UDP: method, path, status, headers, and XML body in human-readable form. Supports both standard HTTP (GET/POST/HTTP) and DH-prefixed variants.
