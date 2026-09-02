@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,12 +16,16 @@ import (
 )
 
 const (
-	BIND_TIMEOUT      = 10 * time.Second
-	HEARTBEAT_TIMEOUT = 10 * time.Second
-	RETRY_ATTEMPTS    = 3
-	RETRY_DELAY       = 2 * time.Second
-	CSEQ_BASE         = 100
-	CSEQ_STEP         = 1000
+	BIND_TIMEOUT   = 10 * time.Second
+	RETRY_ATTEMPTS = 3
+	RETRY_DELAY    = 2 * time.Second
+	CSEQ_BASE      = 100
+	CSEQ_STEP      = 1000
+)
+
+var (
+	HEARTBEAT_TIMEOUT  = 10 * time.Second
+	RELAY_READ_TIMEOUT = 15 * time.Second
 )
 
 var errDeviceNotFound = errors.New("device response: code=404 Not Found")
@@ -50,6 +57,53 @@ type Client struct {
 	conn          net.Conn
 	lastKeepalive time.Time
 	cseq          int
+	remotePort    int
+
+	// Downstream coalescing: the device streams 1280-byte DATA frames;
+	// writing each to the browser as a separate TCP segment makes chatty
+	// protocols (HTTP) crawl while bulk video hides the cost.
+	flushMu    sync.Mutex
+	pending    []byte
+	flushTimer *time.Timer
+}
+
+const (
+	coalesceDelay = 2 * time.Millisecond
+	coalesceMax   = 16 * 1024
+)
+
+// writeData buffers a downstream fragment and flushes to the client socket
+// either when the batch fills or after coalesceDelay elapses.
+func (c *Client) writeData(b []byte) {
+	c.flushMu.Lock()
+	c.pending = append(c.pending, b...)
+	if len(c.pending) >= coalesceMax {
+		out := c.pending
+		c.pending = nil
+		if c.flushTimer != nil {
+			c.flushTimer.Stop()
+			c.flushTimer = nil
+		}
+		c.flushMu.Unlock()
+		c.conn.Write(out)
+		return
+	}
+	if c.flushTimer == nil {
+		c.flushTimer = time.AfterFunc(coalesceDelay, c.flushNow)
+	}
+	c.flushMu.Unlock()
+}
+
+// flushNow drains the pending batch (timer callback or forced).
+func (c *Client) flushNow() {
+	c.flushMu.Lock()
+	out := c.pending
+	c.pending = nil
+	c.flushTimer = nil
+	c.flushMu.Unlock()
+	if len(out) > 0 {
+		c.conn.Write(out)
+	}
 }
 
 type acceptConn struct {
@@ -62,11 +116,14 @@ type specGroup struct {
 	specs []PortSpec
 }
 
+// Tunnel owns one connection cycle to a device: cloud handshake, NAT punch,
+// PTCP session, and the local TCP listeners multiplexed over it.
 type Tunnel struct {
 	serial, username, password, randsalt string
 	dtype                                int
 	debug                                bool
 	logRetries                           bool
+	useTCP                               bool // force TCP-relay data path
 
 	specs   []PortSpec
 	specIdx []int
@@ -75,7 +132,9 @@ type Tunnel struct {
 
 	deviceRemote *UDP
 	mainRemote   *UDP
-	primary      *UDP // data socket: deviceRemote (direct) or mainRemote (relay)
+	primary      *UDP // data path: deviceRemote (direct) or mainRemote (relay)
+	useTCPPath   bool // active data path is the TCP relay channel
+	tou          *touChannel
 	listeners    []net.Listener
 	clients      map[uint32]*Client
 	clientsMu    sync.Mutex
@@ -83,14 +142,31 @@ type Tunnel struct {
 	done         chan struct{}
 	cseqCounter  int
 
-	readerWG sync.WaitGroup // readers + heartbeat goroutines
-	bindMu   sync.Mutex
-	bindWait map[uint32]chan struct{} // realm -> bind ack channel
-	errMu    sync.Mutex
-	failErr  error
+	readerWG  sync.WaitGroup // readLoop + heartbeatLoop goroutines
+	bindMu    sync.Mutex
+	bindWait  map[uint32]chan struct{}
+	bindReqMu sync.Mutex // serializes BIND requests
+	socksMu   sync.Mutex
+	errMu     sync.Mutex
+	failErr   error
+
+	// Realm pool: pre-bound realms per remote port. The camera's web server
+	// closes HTTP connections, so browsers reconnect per request; a pooled
+	// pre-bound realm removes the BIND round-trip from the critical path.
+	// A keeper goroutine maintains the fixed level; in-flight binds are
+	// tracked so refills never overshoot.
+	poolMu     sync.Mutex
+	pools      map[int]*poolState
+	poolTarget int
 }
 
-func newTunnel(serial string, dtype int, username, password, randsalt string, debug, logRetries bool, g specGroup, reg *PortRegistry) *Tunnel {
+// poolState is the per-port pool. All fields guarded by poolMu.
+type poolState struct {
+	queue    []uint32
+	inflight int
+}
+
+func newTunnel(serial string, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, g specGroup, reg *PortRegistry) *Tunnel {
 	t := &Tunnel{
 		serial:      serial,
 		dtype:       dtype,
@@ -99,6 +175,8 @@ func newTunnel(serial string, dtype int, username, password, randsalt string, de
 		randsalt:    randsalt,
 		debug:       debug,
 		logRetries:  logRetries,
+		useTCP:      forceTCP,
+		poolTarget:  poolSize,
 		specs:       g.specs,
 		specIdx:     g.idxs,
 		reg:         reg,
@@ -111,16 +189,24 @@ func newTunnel(serial string, dtype int, username, password, randsalt string, de
 	return t
 }
 
+// reset prepares a fresh generation. readerWG.Wait() drains stale readers from
+// the previous attempt so they cannot poison the new state.
 func (t *Tunnel) reset() {
+	t.readerWG.Wait()
 	t.listeners = nil
 	t.clients = make(map[uint32]*Client)
 	t.acceptCh = make(chan acceptConn, 16)
 	t.done = make(chan struct{})
 	t.cseqCounter = CSEQ_BASE
+	t.socksMu.Lock()
 	t.deviceRemote = nil
 	t.mainRemote = nil
+	t.tou = nil
+	t.useTCPPath = false
+	t.socksMu.Unlock()
 	t.primary = nil
 	t.bindWait = make(map[uint32]chan struct{})
+	t.pools = make(map[int]*poolState)
 	t.failErr = nil
 }
 
@@ -138,11 +224,17 @@ func (t *Tunnel) close() {
 		c.conn.Close()
 	}
 	t.clientsMu.Unlock()
-	if t.deviceRemote != nil {
-		t.deviceRemote.Close()
+	t.socksMu.Lock()
+	dr, mr, tou := t.deviceRemote, t.mainRemote, t.tou
+	t.socksMu.Unlock()
+	if dr != nil {
+		dr.Close()
 	}
-	if t.mainRemote != nil {
-		t.mainRemote.Close()
+	if mr != nil {
+		mr.Close()
+	}
+	if tou != nil {
+		tou.close()
 	}
 }
 
@@ -176,17 +268,20 @@ func (t *Tunnel) markConnecting() {
 	}
 }
 
+// p2pChannelBody builds the /device/<SN>/p2p-channel XML body: Identify (8
+// random bytes space-separated), IpEncrpt flag, and (Type 1) the signed and
+// encrypted auth block.
 func p2pChannelBody(lport, dtype int, username, password, randsalt string, aid []byte) (string, []byte) {
 	laddr := fmt.Sprintf("127.0.0.1:%d", lport)
 	ipaddr := fmt.Sprintf("<IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr>", laddr)
 	authStr := ""
 	var key []byte
 	if dtype > 0 {
-		key = get_key(username, password, randsalt)
-		encNonce := get_nonce()
-		encLaddr := get_enc(key, encNonce, laddr)
+		key = getDeriveKey(username, password, randsalt)
+		encNonce := getNonce()
+		encLaddr := getEnc(key, encNonce, laddr)
 		ipaddr = fmt.Sprintf("<IpEncrptV2>true</IpEncrptV2><LocalAddr>%s</LocalAddr>", encLaddr)
-		authStr = get_auth(username, key, encNonce, laddr, randsalt)
+		authStr = getAuth(username, key, encNonce, laddr, randsalt)
 	}
 
 	aidHex := make([]string, 8)
@@ -199,11 +294,21 @@ func p2pChannelBody(lport, dtype int, username, password, randsalt string, aid [
 	return body, key
 }
 
+// handshake runs the full 4-phase connection: cloud discovery, relay agent
+// allocation, Server Nat Info, inverted STUN punch and PTCP negotiation.
+// On STUN success t.primary = deviceRemote (direct), otherwise mainRemote
+// (relay agent).
 func (t *Tunnel) handshake() error {
 	mainRemote := NewUDP(MAIN_SERVER, MAIN_PORT, t.debug)
 	mainRemote.debugLog = t.logf
+	t.socksMu.Lock()
 	t.mainRemote = mainRemote
+	t.socksMu.Unlock()
+	if mainRemote.initErr != nil {
+		return fmt.Errorf("main socket: %v", mainRemote.initErr)
+	}
 
+	// Phase 1: cloud discovery.
 	mainRemote.Request("/probe/p2psrv", "", true, true)
 	res, _ := mainRemote.Request(fmt.Sprintf("/online/p2psrv/%s", t.serial), "", true, true)
 	if res == nil {
@@ -216,12 +321,14 @@ func (t *Tunnel) handshake() error {
 	p2psrv := strings.SplitN(us, ":", 2)
 	p2psrvPort, _ := strconv.Atoi(p2psrv[1])
 
+	// Warm-up probes to the device's P2P server (US).
 	p2psrvRemote := NewUDP(p2psrv[0], p2psrvPort, t.debug)
 	p2psrvRemote.debugLog = t.logf
 	p2psrvRemote.Request(fmt.Sprintf("/probe/device/%s", t.serial), "", true, true)
 	p2psrvRemote.Request(fmt.Sprintf("/info/device/%s", t.serial), "", true, true)
 	p2psrvRemote.Close()
 
+	// Phase 2: relay dispatcher lookup.
 	res, err := mainRemote.Request("/online/relay", "", true, true)
 	if err != nil {
 		return fmt.Errorf("relay lookup: %v", err)
@@ -229,20 +336,28 @@ func (t *Tunnel) handshake() error {
 	relay := strings.SplitN(res.Body["body/Address"], ":", 2)
 	relayPort, _ := strconv.Atoi(relay[1])
 
+	// Data socket for the device side, bound through the main cloud host.
 	deviceRemote := NewUDP(MAIN_SERVER, MAIN_PORT, t.debug)
 	deviceRemote.debugLog = t.logf
+	t.socksMu.Lock()
 	t.deviceRemote = deviceRemote
+	t.socksMu.Unlock()
+	if deviceRemote.initErr != nil {
+		return fmt.Errorf("device socket: %v", deviceRemote.initErr)
+	}
 
 	if t.dtype > 0 && (t.username == "" || t.password == "") {
 		return fmt.Errorf("username and password required for type > 0")
 	}
 
+	// Phase 3: p2p-channel request with a random 8-byte session id (AID).
 	aid := make([]byte, 8)
 	rand.Read(aid)
 	body, key := p2pChannelBody(deviceRemote.lport, t.dtype, t.username, t.password, t.randsalt, aid)
 
 	deviceRemote.Request(fmt.Sprintf("/device/%s/p2p-channel", t.serial), body, true, false)
 
+	// Relay agent allocation on the main socket.
 	mainRemote.SetRemote(relay[0], relayPort)
 	res, err = mainRemote.Request("/relay/agent", "", true, true)
 	if err != nil {
@@ -257,9 +372,12 @@ func (t *Tunnel) handshake() error {
 	mainRemote.SetRemote(agentParts[0], agentPort)
 	mainRemote.Request(fmt.Sprintf("/relay/start/%s", token), "<body><Client>:0</Client></body>", true, true)
 
-	res, err = deviceRemote.Read(true, 30*time.Second)
+	// Phase 4: Server Nat Info from the device (via cloud/US).
+	t.logf("waiting for p2p-channel ack (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+	res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
 	if err == nil && res.Code < 200 {
-		res, err = deviceRemote.Read(true, 30*time.Second)
+		t.logf("waiting for p2p-channel ack body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
 	}
 	if err != nil {
 		return fmt.Errorf("read device response: %v", err)
@@ -281,7 +399,7 @@ func (t *Tunnel) handshake() error {
 		nonceStr := res.Body["body/Nonce"]
 		if nonceStr != "" {
 			nonceVal, _ := strconv.Atoi(nonceStr)
-			deviceLaddr = get_dec(key, nonceVal, deviceLaddr)
+			deviceLaddr = getDec(key, nonceVal, deviceLaddr)
 		}
 	}
 
@@ -289,25 +407,50 @@ func (t *Tunnel) handshake() error {
 	devPort, _ := strconv.Atoi(devParts[1])
 	deviceRemote.SetRemote(devParts[0], devPort)
 
+	// Notify the device about the relay agent.
 	mainRemote.SetRemote(MAIN_SERVER, MAIN_PORT)
-
 	authStr := ""
 	if t.dtype > 0 {
-		nonce2 := get_nonce()
-		authStr = get_auth(t.username, key, nonce2, "", t.randsalt)
+		nonce2 := getNonce()
+		authStr = getAuth(t.username, key, nonce2, "", t.randsalt)
 	}
-
 	mainRemote.Request(fmt.Sprintf("/device/%s/relay-channel", t.serial),
 		fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentParts[0], agentPort),
 		true, false)
 	mainRemote.SetRemote(agentParts[0], agentPort)
-	if _, err := mainRemote.Read(true, 30*time.Second); err != nil {
+	t.logf("waiting for relay-channel ack from agent %s:%d (timeout %.0fs)", agentParts[0], agentPort, RELAY_READ_TIMEOUT.Seconds())
+	if _, err := mainRemote.Read(true, RELAY_READ_TIMEOUT); err != nil {
 		return fmt.Errorf("relay-channel read: %v", err)
 	}
 
+	policy := res.Body["body/Policy"]
+	tcpRelayAllowed := strings.Contains(policy, "tcprelay")
+
+	// Forced TCP-relay mode: the TOU channel replaces PTCP-over-UDP entirely.
+	if t.useTCP {
+		if err := t.attachTCPRelay(agentParts[0], agentPort, token); err != nil {
+			return err
+		}
+		t.logf("TCP relay channel attached (forced)")
+		return nil
+	}
+
+	// PTCP over relay: SYNC then token request (0x17 -> 0x18).
 	mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
-	p, err := mainRemote.ReadPTCP(30 * time.Second)
+	t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+	p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
 	if err != nil {
+		// UDP relay path dead — try the TCP relay channel if the device
+		// advertises tcprelay support in its policy list.
+		if tcpRelayAllowed {
+			t.logf("ptcp sync over UDP failed (%v) — policy allows tcprelay, trying TCP relay", err)
+			if aerr := t.attachTCPRelay(agentParts[0], agentPort, token); aerr == nil {
+				t.logf("TCP relay channel attached (fallback)")
+				return nil
+			} else {
+				t.logf("TCP relay fallback failed: %v", aerr)
+			}
+		}
 		return fmt.Errorf("ptcp sync: %v", err)
 	}
 
@@ -315,12 +458,14 @@ func (t *Tunnel) handshake() error {
 		0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
 	})
-	p, err = mainRemote.ReadPTCP(30 * time.Second)
+	t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+	p, err = mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
 	if err != nil {
 		return fmt.Errorf("ptcp 0x17: %v", err)
 	}
 	for len(p.Body) == 0 {
-		p, err = mainRemote.ReadPTCP(30 * time.Second)
+		t.logf("waiting for ptcp 0x17 body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		p, err = mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
 		if err != nil {
 			return fmt.Errorf("ptcp 0x17 wait: %v", err)
 		}
@@ -328,6 +473,7 @@ func (t *Tunnel) handshake() error {
 	sign := p.Body[12:]
 	mainRemote.RequestPTCP(nil)
 
+	// Inverted STUN punch (Level 2): build the Init packet from the AID.
 	invAid := make([]byte, 8)
 	for i, b := range aid {
 		invAid[i] = ^b
@@ -410,6 +556,7 @@ func (t *Tunnel) handshake() error {
 		return nil
 	}
 
+	// Confirm the direct channel with a burst of 5 Binding Confirms.
 	confirm := []byte{0xFE, 0xFE, 0xFF, 0xF3}
 	confirm = append(confirm, cookie...)
 	confirm = append(confirm, transID...)
@@ -432,6 +579,7 @@ func (t *Tunnel) handshake() error {
 	}
 	deviceRemote.SetTimeout(0)
 
+	// Direct path: full PTCP auth handshake with the sign token.
 	if err := ptcpHandshake(deviceRemote, sign); err != nil {
 		return fmt.Errorf("ptcp device handshake: %v", err)
 	}
@@ -440,9 +588,26 @@ func (t *Tunnel) handshake() error {
 	return nil
 }
 
+// attachTCPRelay dials the relay agent over TCP and installs the TOU
+// channel as the active data path (docs/REVERSE.md §14-16).
+func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) error {
+	ch, err := dialTCPRelay(agentHost, agentPort, token, t.debug, t.logf)
+	if err != nil {
+		return err
+	}
+	t.socksMu.Lock()
+	t.tou = ch
+	t.useTCPPath = true
+	t.socksMu.Unlock()
+	return nil
+}
+
+// ptcpHandshake runs SYNC -> AUTH_REQ(0x19+sign) -> AUTH_RESP(0x1A) ->
+// AUTH_FINAL(0x1B) against the peer on socket u.
 func ptcpHandshake(u *UDP, signToken []byte) error {
 	u.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
-	p, err := u.ReadPTCP(30 * time.Second)
+	u.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+	p, err := u.ReadPTCP(RELAY_READ_TIMEOUT)
 	if err != nil {
 		return err
 	}
@@ -452,12 +617,14 @@ func ptcpHandshake(u *UDP, signToken []byte) error {
 
 	pkt := append([]byte{0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, signToken...)
 	u.RequestPTCP(pkt)
-	p, err = u.ReadPTCP(30 * time.Second)
+	u.logf("waiting for ptcp auth (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+	p, err = u.ReadPTCP(RELAY_READ_TIMEOUT)
 	if err != nil {
 		return err
 	}
 	for len(p.Body) == 0 {
-		p, err = u.ReadPTCP(30 * time.Second)
+		u.logf("waiting for ptcp auth body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		p, err = u.ReadPTCP(RELAY_READ_TIMEOUT)
 		if err != nil {
 			return err
 		}
@@ -467,7 +634,8 @@ func ptcpHandshake(u *UDP, signToken []byte) error {
 	}
 
 	u.RequestPTCP([]byte{0x1B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-	p, err = u.ReadPTCP(30 * time.Second)
+	u.logf("waiting for ptcp final (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+	p, err = u.ReadPTCP(RELAY_READ_TIMEOUT)
 	if err != nil {
 		return err
 	}
@@ -477,11 +645,12 @@ func ptcpHandshake(u *UDP, signToken []byte) error {
 	return nil
 }
 
+// serve opens the local listeners and pumps traffic until the tunnel dies.
 func (t *Tunnel) serve() error {
 	type okListen struct {
-		idx    int // index in PortRegistry
-		port   int // actual local port after bind
-		remote int // camera port
+		idx    int
+		port   int
+		remote int
 	}
 	oks := []okListen{}
 	for i, spec := range t.specs {
@@ -520,10 +689,26 @@ func (t *Tunnel) serve() error {
 
 	t.primary.lastRecv = time.Now()
 
-	t.readerWG.Add(3)
-	go t.readLoop(t.deviceRemote)
-	go t.readLoop(t.mainRemote)
-	go t.heartbeatLoop()
+	done := t.done
+	if t.useTCPPath {
+		t.readerWG.Add(2)
+		go t.touReadLoop(done)
+		go t.touHeartbeatLoop(done)
+	} else {
+		t.readerWG.Add(3)
+		go t.readLoop(done, t.deviceRemote)
+		go t.readLoop(done, t.mainRemote)
+		go t.heartbeatLoop(done)
+		// Realm pool keepers: maintain pre-bound realms per forwarded port
+		// so browser connection waves never pay the BIND round-trip.
+		t.readerWG.Add(len(oks))
+		for _, o := range oks {
+			t.poolMu.Lock()
+			t.pools[o.remote] = &poolState{}
+			t.poolMu.Unlock()
+			go t.poolKeeper(done, o.remote)
+		}
+	}
 
 	for {
 		select {
@@ -536,11 +721,13 @@ func (t *Tunnel) serve() error {
 	}
 }
 
-func (t *Tunnel) readLoop(u *UDP) {
+// readLoop consumes PTCP frames from one socket. done is the generation
+// token captured at spawn: after a reset this goroutine must exit silently.
+func (t *Tunnel) readLoop(done chan struct{}, u *UDP) {
 	defer t.readerWG.Done()
 	for {
 		select {
-		case <-t.done:
+		case <-done:
 			return
 		default:
 		}
@@ -554,31 +741,128 @@ func (t *Tunnel) readLoop(u *UDP) {
 				}
 				continue
 			}
-			t.fail(err)
+			select {
+			case <-done:
+			default:
+				t.fail(err)
+			}
 			return
 		}
 		t.routePTCP(p, u)
 	}
 }
 
-func (t *Tunnel) heartbeatLoop() {
+// touReadLoop consumes TOU frames from the TCP relay channel.
+func (t *Tunnel) touReadLoop(done chan struct{}) {
+	defer t.readerWG.Done()
+	t.socksMu.Lock()
+	ch := t.tou
+	t.socksMu.Unlock()
+	if ch == nil {
+		return
+	}
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		typ, session, payload, _, err := ch.readFrame(time.Now().Add(tcpRelayFrameTimeout))
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if time.Since(ch.LastRecv()) > HEARTBEAT_TIMEOUT {
+					t.fail(fmt.Errorf("tcp relay heartbeat timeout: no TOU frames for %v", HEARTBEAT_TIMEOUT))
+					return
+				}
+				continue
+			}
+			select {
+			case <-done:
+			default:
+				t.fail(err)
+			}
+			return
+		}
+		switch typ {
+		case touTypeData:
+			if c := t.getClient(session); c != nil && len(payload) > 0 {
+				c.writeData(payload)
+			}
+		case touTypeSyn:
+			// Remote session open — acknowledge per TOU convention.
+			ch.writeAck(session, 0)
+			t.logf("tcp-relay: remote SYN session=%#010x, ACK sent", session)
+		case touTypeAck, touTypeKA, touTypeSrv:
+			// liveness handled via LastRecv
+		default:
+			t.logf("tcp-relay: frame type=0x%02x (ignored)", typ)
+		}
+	}
+}
+
+// touHeartbeatLoop keeps the TCP relay channel and client sessions alive.
+func (t *Tunnel) touHeartbeatLoop(done chan struct{}) {
+	defer t.readerWG.Done()
+	hb := time.NewTicker(tcpRelayKeepaliveEvery)
+	defer hb.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-hb.C:
+			t.socksMu.Lock()
+			ch := t.tou
+			t.socksMu.Unlock()
+			if ch == nil {
+				return
+			}
+			if err := ch.writeKeepalive(0); err != nil {
+				t.fail(fmt.Errorf("tcp relay keepalive: %v", err))
+				return
+			}
+			now := time.Now()
+			t.clientsMu.Lock()
+			for rid, c := range t.clients {
+				if now.Sub(c.lastKeepalive) > 25*time.Second && c.remotePort == 554 {
+					ka := fmt.Sprintf("OPTIONS * RTSP/1.0\r\nCSeq: %d\r\n\r\n", c.cseq)
+					t.writeRealmData(rid, []byte(ka))
+					c.cseq++
+					c.lastKeepalive = now
+				}
+			}
+			t.clientsMu.Unlock()
+		}
+	}
+}
+
+func (t *Tunnel) heartbeatLoop(done chan struct{}) {
 	defer t.readerWG.Done()
 	hb := time.NewTicker(5 * time.Second)
 	defer hb.Stop()
 	for {
 		select {
-		case <-t.done:
+		case <-done:
 			return
 		case <-hb.C:
-			t.mainRemote.RequestPTCP([]byte{})
-			t.primary.RequestPTCP(ptcpHeartbeat)
+			t.socksMu.Lock()
+			mr := t.mainRemote
+			t.socksMu.Unlock()
+			if mr != nil {
+				mr.RequestPTCP([]byte{})
+			}
+			if t.primary != nil {
+				t.primary.RequestPTCP(ptcpHeartbeat)
+			}
 
 			now := time.Now()
 			t.clientsMu.Lock()
 			for rid, c := range t.clients {
-				if now.Sub(c.lastKeepalive) > 25*time.Second {
+				// Inject keepalive bytes only into RTSP realms: OPTIONS
+				// would be protocol garbage inside DVRIP (37777) or HTTP
+				// (80) streams. PTCP heartbeats keep the tunnel itself up.
+				if now.Sub(c.lastKeepalive) > 25*time.Second && c.remotePort == 554 {
 					ka := fmt.Sprintf("OPTIONS * RTSP/1.0\r\nCSeq: %d\r\n\r\n", c.cseq)
-					t.primary.RequestPTCP((&PTCPPayload{Realm: rid, Payload: []byte(ka)}).Bytes())
+					t.writeRealmData(rid, []byte(ka))
 					c.cseq++
 					c.lastKeepalive = now
 				}
@@ -603,14 +887,154 @@ func (t *Tunnel) acceptLoop(ln net.Listener, remotePort int) {
 	}
 }
 
+// popRealm takes a pre-bound realm for the remote port if available.
+func (t *Tunnel) popRealm(remotePort int) (uint32, bool) {
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	st := t.pools[remotePort]
+	if st == nil || len(st.queue) == 0 {
+		return 0, false
+	}
+	r := st.queue[0]
+	st.queue = st.queue[1:]
+	return r, true
+}
+
+func (t *Tunnel) pushRealm(remotePort int, realm uint32) {
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	st := t.pools[remotePort]
+	if st == nil || len(st.queue) >= t.poolTarget {
+		return
+	}
+	st.queue = append(st.queue, realm)
+}
+
+// dropRealm removes a realm from the pool (device discarded it).
+func (t *Tunnel) dropRealm(realm uint32) {
+	t.poolMu.Lock()
+	defer t.poolMu.Unlock()
+	for _, st := range t.pools {
+		for i, r := range st.queue {
+			if r == realm {
+				st.queue = append(st.queue[:i], st.queue[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// preBindRealm opens one realm and parks it in the pool.
+func (t *Tunnel) preBindRealm(remotePort int) {
+	t.poolMu.Lock()
+	st := t.pools[remotePort]
+	if st == nil || t.poolTarget <= 0 ||
+		len(st.queue)+st.inflight >= t.poolTarget {
+		t.poolMu.Unlock()
+		return
+	}
+	st.inflight++
+	t.poolMu.Unlock()
+
+	defer func() {
+		t.poolMu.Lock()
+		st.inflight--
+		t.poolMu.Unlock()
+	}()
+
+	realmID := rand.Uint32()
+	wait := make(chan struct{})
+	t.setBindWait(realmID, wait)
+
+	bindPkt := make([]byte, 20)
+	bindPkt[0] = 0x11
+	binary.BigEndian.PutUint32(bindPkt[4:8], realmID)
+	binary.BigEndian.PutUint32(bindPkt[12:16], uint32(remotePort))
+	bindPkt[16] = 0x7F
+	bindPkt[19] = 0x01
+	t.bindReqMu.Lock()
+	t.primary.RequestPTCP(bindPkt)
+	time.Sleep(3 * time.Millisecond)
+	t.bindReqMu.Unlock()
+
+	select {
+	case <-wait:
+		t.pushRealm(remotePort, realmID)
+		t.logf("Realm pool: pre-bound realm=%#010x port=%d", realmID, remotePort)
+	case <-time.After(BIND_TIMEOUT):
+		t.takeBindWait(realmID)
+	case <-t.done:
+		t.takeBindWait(realmID)
+	}
+}
+
+// poolKeeper maintains the fixed pre-bound realm level for one remote port.
+func (t *Tunnel) poolKeeper(done chan struct{}, remotePort int) {
+	defer t.readerWG.Done()
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-tick.C:
+			t.poolMu.Lock()
+			st := t.pools[remotePort]
+			if st == nil {
+				t.poolMu.Unlock()
+				return
+			}
+			spawn := t.poolTarget - len(st.queue) - st.inflight
+			if spawn < 0 {
+				spawn = 0
+			}
+			t.poolMu.Unlock()
+			for i := 0; i < spawn; i++ {
+				go t.preBindRealm(remotePort)
+			}
+		}
+	}
+}
+
+// handleBind opens one realm: random realm id, BIND frame, wait for STATUS OK.
+// In TCP-relay mode the realm is a TOU session opened with a SYN frame.
+// On the UDP path a pooled pre-bound realm is preferred: no BIND wait.
 func (t *Tunnel) handleBind(ac acceptConn) {
+	if !t.useTCPPath {
+		if realmID, ok := t.popRealm(ac.remotePort); ok {
+			t.logf("Realm pool: hit realm=%#010x port=%d", realmID, ac.remotePort)
+			t.addClient(realmID, ac.conn, ac.remotePort)
+			return
+		}
+	}
+
 	realmID := rand.Uint32()
 	t.logf("Binding realm=%#010x port=%d", realmID, ac.remotePort)
+
+	if t.useTCPPath {
+		t.addClient(realmID, ac.conn, ac.remotePort)
+		t.socksMu.Lock()
+		ch := t.tou
+		t.socksMu.Unlock()
+		if ch == nil {
+			ac.conn.Close()
+			t.delClient(realmID)
+			return
+		}
+		if err := ch.write(touBuildSyn(realmID)); err != nil {
+			t.logf("tcp-relay SYN failed realm=%#010x: %v", realmID, err)
+			t.delClient(realmID)
+			ac.conn.Close()
+			return
+		}
+		t.logf("tcp-relay: SYN sent for session=%#010x (port %d)", realmID, ac.remotePort)
+		return
+	}
 
 	wait := make(chan struct{})
 	t.setBindWait(realmID, wait)
 
-	t.addClient(realmID, ac.conn)
+	t.addClient(realmID, ac.conn, ac.remotePort)
 
 	bindPkt := make([]byte, 20)
 	bindPkt[0] = 0x11
@@ -618,11 +1042,15 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	binary.BigEndian.PutUint32(bindPkt[12:16], uint32(ac.remotePort))
 	bindPkt[16] = 0x7F
 	bindPkt[19] = 0x01
+	bindStart := time.Now()
+	t.bindReqMu.Lock()
 	t.primary.RequestPTCP(bindPkt)
+	time.Sleep(10 * time.Millisecond)
+	t.bindReqMu.Unlock()
 
 	select {
 	case <-wait:
-		t.logf("Bind OK realm=%#010x", realmID)
+		t.logf("Bind OK realm=%#010x in %v", realmID, time.Since(bindStart))
 	case <-time.After(BIND_TIMEOUT):
 		t.logf("Bind FAILED realm=%#010x port=%d", realmID, ac.remotePort)
 		t.delClient(realmID)
@@ -648,12 +1076,13 @@ func (t *Tunnel) takeBindWait(realmID uint32) chan struct{} {
 	return ch
 }
 
-func (t *Tunnel) addClient(realmID uint32, conn net.Conn) {
+func (t *Tunnel) addClient(realmID uint32, conn net.Conn, remotePort int) {
 	t.clientsMu.Lock()
 	t.clients[realmID] = &Client{
 		conn:          conn,
 		lastKeepalive: time.Now(),
 		cseq:          t.cseqCounter,
+		remotePort:    remotePort,
 	}
 	t.cseqCounter += CSEQ_STEP
 	active := len(t.clients)
@@ -674,32 +1103,64 @@ func (t *Tunnel) delClient(realmID uint32) {
 	t.clientsMu.Unlock()
 }
 
+// dataSegmentMax matches the device's own segmentation observed in the
+// capture (1316-byte datagrams = 1280-byte DATA payloads): sending larger
+// frames triggers IP fragmentation and raises loss probability.
+const dataSegmentMax = 1280
+
+// writeRealmData pushes one realm payload down the active data path,
+// segmented to wire-safe sizes.
+func (t *Tunnel) writeRealmData(realm uint32, data []byte) {
+	for len(data) > 0 {
+		n := len(data)
+		if n > dataSegmentMax {
+			n = dataSegmentMax
+		}
+		chunk := data[:n]
+		if t.useTCPPath {
+			t.socksMu.Lock()
+			ch := t.tou
+			t.socksMu.Unlock()
+			if ch == nil {
+				return
+			}
+			ch.writeData(realm, chunk)
+		} else if t.primary != nil {
+			t.primary.RequestPTCP((&PTCPPayload{Realm: realm, Payload: chunk}).Bytes())
+		}
+		data = data[n:]
+	}
+}
+
+// clientReader pumps local TCP bytes into the tunnel as realm DATA.
 func (t *Tunnel) clientReader(conn net.Conn, realmID uint32) {
-	buf := make([]byte, 4096)
+	buf := make([]byte, 16*1024)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			discPkt := make([]byte, 16)
-			discPkt[0] = 0x12
-			binary.BigEndian.PutUint32(discPkt[4:8], realmID)
-			copy(discPkt[12:], "DISC")
-			t.primary.RequestPTCP(discPkt)
+			if !t.useTCPPath {
+				discPkt := make([]byte, 16)
+				discPkt[0] = 0x12
+				binary.BigEndian.PutUint32(discPkt[4:8], realmID)
+				copy(discPkt[12:], "DISC")
+				t.primary.RequestPTCP(discPkt)
+			}
 			t.logf("Disconnected realm=%#010x", realmID)
 			t.delClient(realmID)
 			return
 		}
-		data := make([]byte, n)
-		copy(data, buf[:n])
-		t.primary.RequestPTCP((&PTCPPayload{Realm: realmID, Payload: data}).Bytes())
+		t.writeRealmData(realmID, buf[:n])
 	}
 }
 
+// routePTCP dispatches one inbound PTCP frame. Empty bodies are the peer's
+// pure ACKs — mirror them. Data frames get a coalesced ack (ScheduleAck).
 func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 	if len(p.Body) == 0 {
 		src.RequestPTCP(nil)
 		return
 	}
-	src.RequestPTCP(nil)
+	src.ScheduleAck()
 
 	switch p.Body[0] {
 	case 0x10:
@@ -708,7 +1169,9 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 			return
 		}
 		if c := t.getClient(pl.Realm); c != nil {
-			c.conn.Write(pl.Payload)
+			if c := t.getClient(pl.Realm); c != nil && len(pl.Payload) > 0 {
+				c.writeData(pl.Payload)
+			}
 		}
 	case 0x12:
 		realm := binary.BigEndian.Uint32(p.Body[4:8])
@@ -716,21 +1179,34 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 			close(ch)
 			return
 		}
+		t.dropRealm(realm) // device discarded a pooled realm
 		if c := t.getClient(realm); c != nil {
 			c.conn.Close()
 			t.delClient(realm)
 			t.logf("DVR DISC realm=%#010x", realm)
 		}
 	case 0x13:
+		// Peer heartbeat — liveness is tracked via lastRecv.
+	case 0x0a:
+		// Flow-control / ping frame from device or relay agent; no-op.
 	default:
-		t.logf("PTCP type=%#04x len=%d", p.Body[0], len(p.Body))
+		var sincePrimary float64
+		if t.primary != nil {
+			sincePrimary = time.Since(t.primary.LastRecv()).Seconds()
+		}
+		srcStr := "secondary"
+		if src == t.primary {
+			srcStr = "primary"
+		}
+		t.logf("PTCP type=%#04x len=%d src=%s sincePrimary=%.2fs time=%s hex=%x",
+			p.Body[0], len(p.Body), srcStr, sincePrimary, time.Now().Format("15:04:05.000"), p.Body)
 		if len(p.Body) >= 12 {
 			tryRealm := binary.BigEndian.Uint32(p.Body[4:8])
 			payload := p.Body[12:]
 			if len(payload) > 0 && len(payload) <= 4096 {
 				if c := t.getClient(tryRealm); c != nil {
 					t.logf("Forwarding type 0x%02x as data to realm=%#010x (%d bytes)", p.Body[0], tryRealm, len(payload))
-					c.conn.Write(payload)
+					c.writeData(payload)
 				}
 			}
 		}
@@ -758,10 +1234,12 @@ func (t *Tunnel) failure() error {
 
 func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 	for attempt := 1; ; attempt++ {
+		attemptStart := time.Now()
 		err := t.Run()
 		if err == nil {
 			return
 		}
+		duration := time.Since(attemptStart)
 		if errors.Is(err, errDeviceNotFound) {
 			deviceNotFound(t.serial)
 			if t.reg != nil {
@@ -786,7 +1264,7 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 			return
 		}
 		t.markConnecting()
-		msg := fmt.Sprintf("Tunnel failed, reason - %v, retrying %d/%d", err, attempt, RETRY_ATTEMPTS)
+		msg := fmt.Sprintf("Tunnel failed after %.1fs, reason - %v, retrying %d/%d", duration.Seconds(), err, attempt, RETRY_ATTEMPTS)
 		if t.ui != nil {
 			t.ui.Below(msg)
 		} else {
@@ -803,4 +1281,109 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 		time.Sleep(RETRY_DELAY)
 		t.reset()
 	}
+}
+
+// queryDeviceInfo fetches /info/device/<SN> from the device's P2P server and
+// decrypts the "Info" blob with the hardcoded SDK keys (docs/REVERSE.md
+// 4.2), recovering randsalt / devP2PVersion for Type 1 auth.
+func queryDeviceInfo(serial string, debug bool) int {
+	u := NewUDP(MAIN_SERVER, MAIN_PORT, debug)
+	defer u.Close()
+	if u.initErr != nil {
+		fmt.Fprintf(os.Stderr, "main socket: %v\n", u.initErr)
+		return 1
+	}
+	u.Request("/probe/p2psrv", "", true, true)
+	res, _ := u.Request(fmt.Sprintf("/online/p2psrv/%s", serial), "", true, true)
+	if res == nil || res.Code >= 400 || res.Body["body/US"] == "" {
+		fmt.Printf("%s doesn't exist or turned off.\n", serial)
+		return 1
+	}
+	us := strings.SplitN(res.Body["body/US"], ":", 2)
+	usPort, _ := strconv.Atoi(us[1])
+
+	v := NewUDP(us[0], usPort, debug)
+	defer v.Close()
+	if v.initErr != nil {
+		fmt.Fprintf(os.Stderr, "device socket: %v\n", v.initErr)
+		return 1
+	}
+	v.Request(fmt.Sprintf("/probe/device/%s", serial), "", true, true)
+	v.Request(fmt.Sprintf("/info/device/%s", serial), "", true, false)
+
+	data, err := v.Recv(65536, RELAY_READ_TIMEOUT)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "info read: %v\n", err)
+		return 1
+	}
+	text := strings.TrimSpace(string(data))
+	if debug {
+		fmt.Println(text)
+	}
+
+	fields := map[string]string{}
+	if strings.HasPrefix(text, "{") {
+		if err := json.Unmarshal([]byte(text), &fields); err != nil {
+			fmt.Fprintf(os.Stderr, "json parse: %v\n", err)
+			return 1
+		}
+	} else {
+		resp := ParseDHResponse(text)
+		for k, val := range resp.Body {
+			fields[strings.TrimPrefix(k, "body/")] = val
+		}
+	}
+
+	if v2 := fields["devp2pver"]; v2 != "" {
+		fmt.Printf("devP2PVersion : %s\n", v2)
+	}
+	if dv := fields["DevVersion"]; dv != "" {
+		fmt.Printf("DevVersion    : %s\n", dv)
+	}
+
+	info := fields["Info"]
+	if info == "" {
+		fmt.Println("Info field   : (absent — device provided no encrypted blob)")
+		return 0
+	}
+	plain, err := decryptDevInfoInfo(info)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "decrypt Info: %v\n", err)
+		return 1
+	}
+	if !isMostlyPrintable(plain) {
+		fmt.Fprintf(os.Stderr, "decrypt Info: result is not printable, raw: %x\n", plain)
+		return 1
+	}
+	fmt.Println("Info (plain) :")
+	inner := map[string]string{}
+	if json.Unmarshal(plain, &inner) == nil {
+		keys := make([]string, 0, len(inner))
+		for k := range inner {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Printf("  %-16s = %s\n", k, inner[k])
+		}
+		if inner["randsalt"] != "" {
+			fmt.Printf("\nUse: dh-fwd %s -t 1 -u <user> -P <pass> -s %s\n", serial, inner["randsalt"])
+		}
+	} else {
+		fmt.Println(string(plain))
+	}
+	return 0
+}
+
+func isMostlyPrintable(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	ok := 0
+	for _, c := range b {
+		if (c >= 0x20 && c < 0x7F) || c == '\n' || c == '\r' || c == '\t' {
+			ok++
+		}
+	}
+	return ok*100/len(b) > 90
 }

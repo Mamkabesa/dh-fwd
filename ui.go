@@ -19,6 +19,8 @@ type uiMsg struct {
 	text string
 }
 
+// UI serializes console output for multi-tunnel mode: all lines go through
+// one writer goroutine so parallel tunnels never interleave mid-line.
 type UI struct {
 	ch chan uiMsg
 	w  io.Writer

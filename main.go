@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -101,12 +100,14 @@ func (r *PortRegistry) set(idx int, st PortState, reason string) {
 }
 
 func (r *PortRegistry) connecting(idx int) { r.set(idx, PortConnecting, "") }
+
 func (r *PortRegistry) okPort(idx, localPort int) {
 	r.mu.Lock()
 	r.actualPorts[idx] = localPort
 	r.mu.Unlock()
 	r.set(idx, PortOK, "")
 }
+
 func (r *PortRegistry) fail(idx int, reason string) {
 	r.set(idx, PortFAIL, reason)
 }
@@ -144,23 +145,46 @@ func (r *PortRegistry) failEntries() []failEntry {
 	return out
 }
 
-func main() {
-	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
-		serial := os.Args[1]
-		rest := append([]string{os.Args[0]}, os.Args[2:]...)
-		rest = append(rest, serial)
-		os.Args = rest
+func parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for len(args) > 0 {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		consumed := len(args) - fs.NArg()
+		if consumed > 0 && args[consumed-1] == "--" {
+			positional = append(positional, fs.Args()...)
+			break
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
 	}
+	return positional, nil
+}
 
-	var debug, decodeMode, logRetries bool
+func main() {
+	var debug, logRetries, infoMode, tcpRelayMode bool
+	var smartpssPreset bool
+	var poolSize int
 	var dtype int
 	var username, password, randsalt string
-	var decodeType string
 	var threads int
 	var portSpec string
+	var hbTimeout time.Duration
 
-	flag.BoolVar(&debug, "d", false, "debug protocol output")
 	flag.BoolVar(&debug, "debug", false, "debug protocol output")
+	flag.BoolVar(&debug, "d", false, "debug protocol output")
+	flag.BoolVar(&infoMode, "info", false, "query /info/device/<SN> and decrypt the Info blob (randsalt, devP2PVersion)")
+	flag.BoolVar(&tcpRelayMode, "R", false, "force the TCP-relay data path (TOU over TCP)")
+	flag.BoolVar(&tcpRelayMode, "tcp-relay", false, "force the TCP-relay data path (TOU over TCP)")
+	flag.BoolVar(&smartpssPreset, "2", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
+	flag.BoolVar(&smartpssPreset, "smartpss", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
+	flag.BoolVar(&smartpssPreset, "smart-pss", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
+	flag.IntVar(&poolSize, "pool", 50, "pre-bound realms per forwarded port (default 50; 0 disables pooling)")
+	flag.IntVar(&poolSize, "pools", 50, "pre-bound realms per forwarded port (default 50; 0 disables pooling)")
 	flag.IntVar(&dtype, "t", 0, "device type: 0 = no auth (default), 1 = with auth")
 	flag.IntVar(&dtype, "type", 0, "device type: 0 = no auth (default), 1 = with auth")
 	flag.StringVar(&username, "u", "", "username (required when --type 1)")
@@ -169,50 +193,32 @@ func main() {
 	flag.StringVar(&password, "password", "", "password (required when --type 1)")
 	flag.StringVar(&randsalt, "s", "", "RandSalt from the info blob")
 	flag.StringVar(&randsalt, "randsalt", "", "RandSalt from the info blob")
-	flag.BoolVar(&decodeMode, "decode", false, "offline packet dissector mode")
-	flag.BoolVar(&decodeMode, "D", false, "offline packet dissector mode")
-	flag.StringVar(&decodeType, "decode-type", "auto", "decode type: auto, dhttp, istun, ptcp")
-	flag.StringVar(&decodeType, "T", "auto", "decode type: auto, dhttp, istun, ptcp")
 	flag.StringVar(&portSpec, "port", "", `port mapping "local:camera" (e.g. "5080,5081:80,81"); without ':' = camera ports only, local is random ephemeral (e.g. "80-85"); "0:81" = ephemeral local`)
 	flag.StringVar(&portSpec, "p", "", `port mapping "local:camera" (e.g. "5080,5081:80,81"); without ':' = camera ports only, local is random ephemeral (e.g. "80-85"); "0:81" = ephemeral local`)
 	flag.IntVar(&threads, "threads", 3, "number of parallel tunnels")
 	flag.IntVar(&threads, "mt", 3, "number of parallel tunnels")
 	flag.BoolVar(&logRetries, "log-retries", false, "log retry details")
 	flag.BoolVar(&logRetries, "lr", false, "log retry details")
+	flag.DurationVar(&hbTimeout, "heartbeat-timeout", 10*time.Second, "PTCP heartbeat timeout")
+	flag.DurationVar(&hbTimeout, "hb", 10*time.Second, "PTCP heartbeat timeout")
 	flag.Usage = usage
-	flag.Parse()
 
-	if decodeMode {
-		var input []byte
-		if flag.NArg() > 0 {
-			raw := strings.Join(flag.Args(), " ")
-			raw = strings.NewReplacer(" ", "", "\n", "", "\t", "", "0x", "", "\\x", "").Replace(raw)
-			var err error
-			input, err = hex.DecodeString(raw)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "decode hex: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			stat, _ := os.Stdin.Stat()
-			if (stat.Mode() & os.ModeCharDevice) != 0 {
-				fmt.Fprintln(os.Stderr, "usage: dh-fwd --decode [--decode-type type] <hex>")
-				os.Exit(1)
-			}
-			buf := make([]byte, 65536)
-			n, _ := os.Stdin.Read(buf)
-			input = make([]byte, n)
-			copy(input, buf[:n])
-		}
-		decodePacket(decodeType, input)
-		return
+	positional, err := parseArgs(flag.CommandLine, os.Args[1:])
+	if err != nil {
+		os.Exit(2)
 	}
 
-	if flag.NArg() < 1 {
+	HEARTBEAT_TIMEOUT = hbTimeout
+
+	if len(positional) < 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
-	serial := flag.Arg(0)
+	serial := positional[0]
+
+	if infoMode {
+		os.Exit(queryDeviceInfo(serial, debug))
+	}
 
 	if dtype > 0 && (username == "" || password == "") {
 		fmt.Fprintln(os.Stderr, "username and password required for type > 0")
@@ -223,6 +229,9 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "port spec: %v\n", err)
 		os.Exit(1)
+	}
+	if smartpssPreset {
+		specs = []PortSpec{{Local: 0, Remote: 80}, {Local: 0, Remote: 37777}}
 	}
 	if threads < 1 {
 		threads = 1
@@ -236,22 +245,27 @@ func main() {
 	})
 
 	if multi {
-		runMulti(serial, specs, threads, dtype, username, password, randsalt, debug, logRetries)
+		runMulti(serial, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
 	} else {
-		runSingle(serial, specs[0], dtype, username, password, randsalt, debug, logRetries)
+		runSingle(serial, specs[0], dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
 	}
 }
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: dh-fwd [options] <serial>
-
-Tunnels ports of a Dahua P2P camera (identified by its serial number) to
-localhost over the DH "Dahua HTTP P2P" cloud protocol. The serial may be
-written before or after the flags.
+       dh-fwd <serial> [options]
 
 General:
-  --debug, -d             debug protocol output
-  --log-retries, -lr      log retry details
+  --debug, -d                     debug protocol output
+  --log-retries, -lr              log retry details
+  --heartbeat-timeout, -hb <dur>  PTCP heartbeat timeout (default 10s)
+  --info                          decrypt /info/device/<SN> Info blob
+                                  (prints randsalt / devP2PVersion)
+  --tcp-relay, -R                 force the TCP-relay data path (TOU over TCP)
+  --smartpss, --smart-pss, -2     SmartPSS preset: forward 80+37777 on free
+                                  local ports (DVRIP + web/API channels)
+  --pool, --pools <n>             pre-bound realms per forwarded port
+                                  (default 50; 0 disables pooling)
 
 Device auth:
   --type, -t <0|1>        device type: 0 = no auth (default), 1 = with auth
@@ -266,14 +280,10 @@ Ports:
                           Default: one tunnel 554:554
   --threads, -mt <n>      number of parallel tunnels (default 3)
 
-Decode:
-  --decode, -D            offline packet dissector (reads hex from argv or stdin)
-  --decode-type, -T <t>   packet layer: auto, dhttp, istun, ptcp (default "auto")
-
 Examples:
-  dh-fwd 4E0743BPAGFE388 -p 5080,5081:80,81
-  dh-fwd 4E0743BPAGFE388 -t 1 -u admin -P secret -p 5080:554
-  dh-fwd -D -T ptcp 01000f12...
+  dh-fwd SN -p 5080,5081:80,81
+  dh-fwd SN -t 1 -u admin -P undervolter -p 5080:554
+  dh-fwd SN -p 1337:80 --pool 50
 `)
 }
 
@@ -379,9 +389,9 @@ func makePortSpecs(locals, remotes []int) ([]PortSpec, error) {
 	return specs, nil
 }
 
-func runSingle(serial string, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool) {
+func runSingle(serial string, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{spec}}
-	t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, g, nil)
+	t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, nil)
 	runWithRetries(t, func(err error) {
 		if errors.Is(err, errDeviceNotFound) {
 			os.Exit(1)
@@ -391,6 +401,8 @@ func runSingle(serial string, spec PortSpec, dtype int, username, password, rand
 	})
 }
 
+// verifyDevice performs a lightweight existence check (and, for Type 1, a
+// full auth round-trip) before spawning parallel tunnels in multi mode.
 func verifyDevice(serial string, dtype int, username, password, randsalt string, debug bool) bool {
 	u := NewUDP(MAIN_SERVER, MAIN_PORT, debug)
 	defer u.Close()
@@ -410,9 +422,9 @@ func verifyDevice(serial string, dtype int, username, password, randsalt string,
 	rand.Read(aid)
 	body, _ := p2pChannelBody(u.lport, dtype, username, password, randsalt, aid)
 	u.Request(fmt.Sprintf("/device/%s/p2p-channel", serial), body, true, false)
-	res, err = u.Read(true, 30*time.Second)
+	res, err = u.Read(true, RELAY_READ_TIMEOUT)
 	if err == nil && res.Code < 200 {
-		res, err = u.Read(true, 30*time.Second)
+		res, err = u.Read(true, RELAY_READ_TIMEOUT)
 	}
 	if err != nil {
 		return false
@@ -430,7 +442,7 @@ func distribute(specs []PortSpec, threads int) []specGroup {
 	return groups
 }
 
-func runMulti(serial string, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool) {
+func runMulti(serial string, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
 	if !verifyDevice(serial, dtype, username, password, randsalt, debug) {
 		deviceNotFound(serial)
 		os.Exit(1)
@@ -445,7 +457,7 @@ func runMulti(serial string, specs []PortSpec, threads int, dtype int, username,
 		if len(g.idxs) == 0 {
 			continue
 		}
-		t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, g, reg)
+		t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
 		for _, idx := range g.idxs {
 			live.Store(idx, t)
 		}
@@ -486,7 +498,7 @@ func runMulti(serial string, specs []PortSpec, threads int, dtype int, username,
 				for _, f := range fails {
 					reg.connecting(f.idx)
 					g := specGroup{idxs: []int{f.idx}, specs: []PortSpec{f.spec}}
-					t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, g, reg)
+					t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
 					live.Store(f.idx, t)
 					go runWithRetries(t, nil)
 				}

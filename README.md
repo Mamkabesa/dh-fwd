@@ -13,15 +13,21 @@ A tool for creating tunnels to Dahua cameras (by serial number) and forwarding a
 ## Improvements 
 
 - Supports **forwarding multiple ports at once**
-- **Packet decoder** (`--decode`) — parses captured packets offline (DH HTTP, inverted STUN, PTCP).
-- Sends **heartbeat**  and **RTSP keepalive** to maintain the tunnel.
+- Supports **multithreading**
+- Can build stable tunnels
+
+### Not tested
+ - Type 1 Auth support
+
+> [!NOTE]
+> Dahua may reject requests due to time mismatch.
 
 ## Build
 
-Requires Go 1.22+.
+Requires Go 1.26+.
 
 ```sh
-git clone https://github.com/Mamkabesa/dh-fwd
+git clone https://github.com/undervolter/dh-fwd
 cd dh-fwd
 go build -o dh-fwd .
 
@@ -36,16 +42,10 @@ Or:
 ./dh-fwd <serial> [options]
 
 ```
-### Known bugs
 
-- Authentication through the web browser is not working (cam's response: Login error)
-- Dahua may reject requests due to time mismatch
 
-### Under development
-
-- Add support for cameras which require Type 1 Auth
-- Fix some bugs
-- Add support for web login via port 80
+### Not tested
+ - Type 1 Auth support
 
 ### Flags
 | Flag | Short | Description |
@@ -53,8 +53,8 @@ Or:
 | --debug | -d | Verbose protocol debug output (requests, STUN packets, PTCP frames) |
 | --port | -p | Port mapping (see below) |
 | --threads | -mt | Number of threads (default 3) |
-| --decode | -D | Packet decoder mode |
-| --decode-type | -T | What to decode: auto, dhttp, istun, ptcp (default auto) |
+| --pool | - | Counter of pools |
+| --smart-pss | -2 | Forwards ports 80 and 37777 at the same time |
 | --help | -h | Show command list |
 ### Port Syntax (--port)
 There are two ports: **local** (the one we listen on) and **remote** (the one the camera exposes).
@@ -67,7 +67,7 @@ There are two ports: **local** (the one we listen on) and **remote** (the one th
  * -p 80-85 — port range
  * 0:81 — local port 0 means "any free port"
  * If no port is specified, default port 554 is used.
-Local ports are bound to 127.0.0.1.
+Local ports are bound to localhost.
 
 > [!WARNING]
 > If you run the software without the -p flag or specify a listening port <1024 without running the program with sudo, you may encounter the following error:
@@ -94,13 +94,7 @@ Opening 2 ports on SN | Threads: 3
 Obtained 2 ports on SN:80,81 | localhost:5080,5081
 
 ```
-**Decode** — parses a captured packet offline without connecting to the camera:
-```sh
-./dh-fwd -D -T ptcp <hex>
-./dh-fwd -D -T auto 0x... 0x...
-echo '<hex>' | ./dh-fwd -D
 
-```
 ## What is Dahua P2P protocol?
 This is a proprietary Dahua cloud protocol used to connect to cameras via the cloud, even if the device is behind multiple NATs. The connection sequence operates as follows: the client (SmartPSS or dh-fwd) sends a request to the main server → receives an intermediate server → creates a communication channel → attempts NAT traversal → establishes a tunnel.
 > [!IMPORTANT]
