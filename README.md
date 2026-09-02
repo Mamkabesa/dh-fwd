@@ -95,12 +95,7 @@ Obtained 2 ports on SN:80,81 | localhost:5080,5081
 This is a proprietary Dahua cloud protocol used to connect to cameras via the cloud, even if the device is behind multiple NATs. The connection sequence operates as follows: the client (SmartPSS or dh-fwd) sends a request to the main server → receives an intermediate server → creates a communication channel → attempts NAT traversal → establishes a tunnel.
 > [!IMPORTANT]
 > Until 2025, Dahua P2P servers established tunnels without mandatory authentication. Following reported protocol vulnerabilities, devices released after late 2024 require authentication **BEFORE** establishing a tunnel. 
-## Decode Mode Details
-The -T flag specifies which layer to decode, while auto detects it by the first 4 magic bytes:
- * **dhttp** — DH HTTP-over-UDP: method, path, status, headers, and XML body in human-readable form. Supports both standard HTTP (GET/POST/HTTP) and DH-prefixed variants.
- * **istun** — inverted STUN: reverses the inversion and displays message type (*Binding Request/Response/Error*), transaction ID, and attributes (*MAPPED-ADDRESS*, *XOR-MAPPED-ADDRESS* with XOR decoding, *USERNAME*, *REALM*, *NONCE*, *MESSAGE-INTEGRITY*, *FINGERPRINT*).
- * **ptcp** — PTCP frame header plus body parsing by type: 0x00 SYNC, 0x10 DATA (realm + payload as string or hex), 0x11 BIND, 0x12 STATUS, 0x13 HEARTBEAT.
-Useful for reverse engineering and debugging: capture a packet (e.g. with tcpdump), pipe or pass it to dh-fwd -D -T auto <hex>, and receive formatted output.
+
 ## Credits
 Based on:
  * khoanguyen-3fc/dh-p2p — main protocol reference
