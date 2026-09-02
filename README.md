@@ -43,10 +43,6 @@ Or:
 
 ```
 
-
-### Not tested
- - Type 1 Auth support
-
 ### Flags
 | Flag | Short | Description |
 |---|---|---|
