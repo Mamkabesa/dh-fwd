@@ -392,7 +392,9 @@ func makePortSpecs(locals, remotes []int) ([]PortSpec, error) {
 func runSingle(serial string, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{spec}}
 	t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, nil)
-	runWithRetries(t, func(err error) {
+	cp := NewConnectProgress(os.Stdout, serial, spec.Remote)
+	t.progress = cp
+	runWithRetries(t, cp, func(err error) {
 		if errors.Is(err, errDeviceNotFound) {
 			os.Exit(1)
 		}
@@ -461,7 +463,7 @@ func runMulti(serial string, specs []PortSpec, threads int, dtype int, username,
 		for _, idx := range g.idxs {
 			live.Store(idx, t)
 		}
-		go runWithRetries(t, nil)
+		go runWithRetries(t, nil, nil)
 	}
 
 	summarized := false
@@ -500,7 +502,7 @@ func runMulti(serial string, specs []PortSpec, threads int, dtype int, username,
 					g := specGroup{idxs: []int{f.idx}, specs: []PortSpec{f.spec}}
 					t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
 					live.Store(f.idx, t)
-					go runWithRetries(t, nil)
+					go runWithRetries(t, nil, nil)
 				}
 				summarized = false
 			}

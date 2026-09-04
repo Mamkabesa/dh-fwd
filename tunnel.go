@@ -129,6 +129,7 @@ type Tunnel struct {
 	specIdx []int
 	reg     *PortRegistry
 	ui      *UI
+	progress *ConnectProgress // non-nil only in single-port mode
 
 	deviceRemote *UDP
 	mainRemote   *UDP
@@ -159,6 +160,7 @@ type Tunnel struct {
 	pools      map[int]*poolState
 	poolTarget int
 }
+
 
 // poolState is the per-port pool. All fields guarded by poolMu.
 type poolState struct {
@@ -259,6 +261,15 @@ func (t *Tunnel) logf(format string, args ...any) {
 	}
 }
 
+// statusf advances the progress bar to the given phase.
+// In debug mode the status is also emitted as a log line.
+func (t *Tunnel) statusf(phase int, status string) {
+	if t.progress != nil {
+		t.progress.Phase(phase, status)
+	}
+	t.logf("[phase %d] %s", phase, status)
+}
+
 func (t *Tunnel) markConnecting() {
 	if t.reg == nil {
 		return
@@ -309,6 +320,7 @@ func (t *Tunnel) handshake() error {
 	}
 
 	// Phase 1: cloud discovery.
+	t.statusf(PhaseCloudLookup, "cloud lookup")
 	mainRemote.Request("/probe/p2psrv", "", true, true)
 	res, _ := mainRemote.Request(fmt.Sprintf("/online/p2psrv/%s", t.serial), "", true, true)
 	if res == nil {
@@ -322,6 +334,7 @@ func (t *Tunnel) handshake() error {
 	p2psrvPort, _ := strconv.Atoi(p2psrv[1])
 
 	// Warm-up probes to the device's P2P server (US).
+	t.statusf(PhaseDeviceProbe, "device probe")
 	p2psrvRemote := NewUDP(p2psrv[0], p2psrvPort, t.debug)
 	p2psrvRemote.debugLog = t.logf
 	p2psrvRemote.Request(fmt.Sprintf("/probe/device/%s", t.serial), "", true, true)
@@ -329,6 +342,7 @@ func (t *Tunnel) handshake() error {
 	p2psrvRemote.Close()
 
 	// Phase 2: relay dispatcher lookup.
+	t.statusf(PhaseRelayAlloc, "relay lookup")
 	res, err := mainRemote.Request("/online/relay", "", true, true)
 	if err != nil {
 		return fmt.Errorf("relay lookup: %v", err)
@@ -351,6 +365,7 @@ func (t *Tunnel) handshake() error {
 	}
 
 	// Phase 3: p2p-channel request with a random 8-byte session id (AID).
+	t.statusf(PhaseP2PChannel, "p2p-channel")
 	aid := make([]byte, 8)
 	rand.Read(aid)
 	body, key := p2pChannelBody(deviceRemote.lport, t.dtype, t.username, t.password, t.randsalt, aid)
@@ -358,6 +373,7 @@ func (t *Tunnel) handshake() error {
 	deviceRemote.Request(fmt.Sprintf("/device/%s/p2p-channel", t.serial), body, true, false)
 
 	// Relay agent allocation on the main socket.
+	t.statusf(PhaseRelayAlloc, "relay agent alloc")
 	mainRemote.SetRemote(relay[0], relayPort)
 	res, err = mainRemote.Request("/relay/agent", "", true, true)
 	if err != nil {
@@ -373,6 +389,7 @@ func (t *Tunnel) handshake() error {
 	mainRemote.Request(fmt.Sprintf("/relay/start/%s", token), "<body><Client>:0</Client></body>", true, true)
 
 	// Phase 4: Server Nat Info from the device (via cloud/US).
+	t.statusf(PhaseP2PChannel, "waiting for device ack")
 	t.logf("waiting for p2p-channel ack (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
 	res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
 	if err == nil && res.Code < 200 {
@@ -408,19 +425,36 @@ func (t *Tunnel) handshake() error {
 	deviceRemote.SetRemote(devParts[0], devPort)
 
 	// Notify the device about the relay agent.
+	// If the relay agent doesn't ack in time we retry once: cloud sometimes
+	// takes a few extra seconds to propagate the relay assignment.
+	t.statusf(PhaseRelayChannel, "relay-channel")
 	mainRemote.SetRemote(MAIN_SERVER, MAIN_PORT)
 	authStr := ""
 	if t.dtype > 0 {
 		nonce2 := getNonce()
 		authStr = getAuth(t.username, key, nonce2, "", t.randsalt)
 	}
-	mainRemote.Request(fmt.Sprintf("/device/%s/relay-channel", t.serial),
-		fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentParts[0], agentPort),
-		true, false)
+	sendRelayChannel := func() {
+		mainRemote.Request(fmt.Sprintf("/device/%s/relay-channel", t.serial),
+			fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentParts[0], agentPort),
+			true, false)
+	}
+	sendRelayChannel()
 	mainRemote.SetRemote(agentParts[0], agentPort)
 	t.logf("waiting for relay-channel ack from agent %s:%d (timeout %.0fs)", agentParts[0], agentPort, RELAY_READ_TIMEOUT.Seconds())
 	if _, err := mainRemote.Read(true, RELAY_READ_TIMEOUT); err != nil {
-		return fmt.Errorf("relay-channel read: %v", err)
+		// Retry: send relay-channel once more and wait again.
+		// The cloud sometimes takes several extra seconds to propagate the
+		// relay assignment to the agent; a single retry covers this case.
+		t.logf("relay-channel ack timed out (%v) — retrying", err)
+		t.statusf(PhaseRelayChannel, "relay-channel retry")
+		mainRemote.SetRemote(MAIN_SERVER, MAIN_PORT)
+		sendRelayChannel()
+		mainRemote.SetRemote(agentParts[0], agentPort)
+		t.logf("waiting for relay-channel ack (retry, timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		if _, err2 := mainRemote.Read(true, RELAY_READ_TIMEOUT); err2 != nil {
+			return fmt.Errorf("relay-channel read: %v", err2)
+		}
 	}
 
 	policy := res.Body["body/Policy"]
@@ -428,6 +462,7 @@ func (t *Tunnel) handshake() error {
 
 	// Forced TCP-relay mode: the TOU channel replaces PTCP-over-UDP entirely.
 	if t.useTCP {
+		t.statusf(PhasePTCPHandshake, "TCP relay attach")
 		if err := t.attachTCPRelay(agentParts[0], agentPort, token); err != nil {
 			return err
 		}
@@ -436,6 +471,7 @@ func (t *Tunnel) handshake() error {
 	}
 
 	// PTCP over relay: SYNC then token request (0x17 -> 0x18).
+	t.statusf(PhaseNATPunch, "PTCP sync")
 	mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 	t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
 	p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
@@ -444,6 +480,7 @@ func (t *Tunnel) handshake() error {
 		// advertises tcprelay support in its policy list.
 		if tcpRelayAllowed {
 			t.logf("ptcp sync over UDP failed (%v) — policy allows tcprelay, trying TCP relay", err)
+			t.statusf(PhasePTCPHandshake, "TCP relay fallback")
 			if aerr := t.attachTCPRelay(agentParts[0], agentPort, token); aerr == nil {
 				t.logf("TCP relay channel attached (fallback)")
 				return nil
@@ -454,6 +491,7 @@ func (t *Tunnel) handshake() error {
 		return fmt.Errorf("ptcp sync: %v", err)
 	}
 
+	t.statusf(PhaseNATPunch, "PTCP token")
 	mainRemote.RequestPTCP([]byte{
 		0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00,
@@ -474,6 +512,7 @@ func (t *Tunnel) handshake() error {
 	mainRemote.RequestPTCP(nil)
 
 	// Inverted STUN punch (Level 2): build the Init packet from the AID.
+	t.statusf(PhaseNATPunch, "NAT punch")
 	invAid := make([]byte, 8)
 	for i, b := range aid {
 		invAid[i] = ^b
@@ -552,11 +591,13 @@ func (t *Tunnel) handshake() error {
 
 	if stunResponse == nil {
 		t.logf("STUN failed — using relay agent as the data path")
+		t.statusf(PhasePTCPHandshake, "relay path")
 		t.primary = mainRemote
 		return nil
 	}
 
 	// Confirm the direct channel with a burst of 5 Binding Confirms.
+	t.statusf(PhasePTCPHandshake, "PTCP handshake")
 	confirm := []byte{0xFE, 0xFE, 0xFF, 0xF3}
 	confirm = append(confirm, cookie...)
 	confirm = append(confirm, transID...)
@@ -681,7 +722,11 @@ func (t *Tunnel) serve() error {
 			t.reg.okPort(o.idx, o.port)
 		}
 	}
-	if t.ui == nil {
+	if t.progress != nil {
+		// Single-mode: overwrite the progress bar line with the final "Listening" message.
+		o := oks[0]
+		t.progress.Done(fmt.Sprintf("Listening on :%d → :%d", o.port, o.remote))
+	} else if t.ui == nil {
 		for _, o := range oks {
 			fmt.Printf("Listening on port %d, remote port %d\n", o.port, o.remote)
 		}
@@ -1232,11 +1277,16 @@ func (t *Tunnel) failure() error {
 	return t.failErr
 }
 
-func runWithRetries(t *Tunnel, onExhausted func(err error)) {
+func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error)) {
 	for attempt := 1; ; attempt++ {
+		if cp != nil {
+			cp.SetAttempt(attempt)
+			t.progress = cp
+		}
 		attemptStart := time.Now()
 		err := t.Run()
 		if err == nil {
+			// cp.Done() was already called from serve() when listeners came up.
 			return
 		}
 		duration := time.Since(attemptStart)
@@ -1246,6 +1296,9 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 				for _, idx := range t.specIdx {
 					t.reg.fail(idx, err.Error())
 				}
+			}
+			if cp != nil {
+				cp.Fail("device not found")
 			}
 			if onExhausted != nil {
 				onExhausted(err)
@@ -1258,6 +1311,9 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 					t.reg.fail(idx, err.Error())
 				}
 			}
+			if cp != nil {
+				cp.Fail(err.Error())
+			}
 			if onExhausted != nil {
 				onExhausted(err)
 			}
@@ -1265,7 +1321,10 @@ func runWithRetries(t *Tunnel, onExhausted func(err error)) {
 		}
 		t.markConnecting()
 		msg := fmt.Sprintf("Tunnel failed after %.1fs, reason - %v, retrying %d/%d", duration.Seconds(), err, attempt, RETRY_ATTEMPTS)
-		if t.ui != nil {
+		if cp != nil {
+			// Reset the bar to 0% for the next attempt, keep the error visible briefly.
+			cp.Reset(fmt.Sprintf("retry %d/%d: %s", attempt+1, RETRY_ATTEMPTS, err.Error()))
+		} else if t.ui != nil {
 			t.ui.Below(msg)
 		} else {
 			fmt.Println(msg)
