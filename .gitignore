@@ -2,3 +2,5 @@ dh-fwd
 dh-fwd.exe
 *.exe
 *.bin
+builds/
+*.exe~
